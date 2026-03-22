@@ -1,6 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
@@ -32,7 +34,7 @@ function createMcpServer(): McpServer {
     'get_all_messages',
     {
       title: '获取所有留言',
-      description: '获取留言板上的所有留言',
+      description: '获取留言板上的所有留言，包括每条留言的内容、作者、时间和回复',
       inputSchema: z.object({})
     },
     async () => {
@@ -47,7 +49,7 @@ function createMcpServer(): McpServer {
     'get_message_by_id',
     {
       title: '获取留言详情',
-      description: '根据ID获取特定留言',
+      description: '根据ID获取特定留言的详细信息',
       inputSchema: z.object({
         messageId: z.string().describe('留言的ID')
       })
@@ -70,7 +72,7 @@ function createMcpServer(): McpServer {
     'create_message',
     {
       title: '创建留言',
-      description: '创建一条新留言',
+      description: '在留言板上创建一条新留言',
       inputSchema: z.object({
         content: z.string().describe('留言内容'),
         author: z.string().optional().default('Claude').describe('留言者名称')
@@ -141,6 +143,8 @@ async function runStdio(): Promise<void> {
   await server.connect(transport);
 }
 
+const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
+
 async function runHTTP(): Promise<void> {
   const app = express();
   
@@ -148,7 +152,7 @@ async function runHTTP(): Promise<void> {
     origin: '*',
     methods: ['GET', 'POST', 'OPTIONS', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-    exposedHeaders: ['Content-Type', 'mcp-session-id'],
+    exposedHeaders: ['WWW-Authenticate', 'Mcp-Session-Id', 'Last-Event-Id', 'Mcp-Protocol-Version'],
     credentials: false
   }));
   
@@ -165,33 +169,86 @@ async function runHTTP(): Promise<void> {
   });
 
   app.post('/mcp', async (req, res) => {
-    console.log('收到 POST /mcp 请求');
-    const server = createMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined
-    });
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    console.log('收到 POST /mcp 请求, sessionId:', sessionId);
+
+    try {
+      let transport: StreamableHTTPServerTransport;
+      
+      if (sessionId && transports[sessionId]) {
+        transport = transports[sessionId];
+      } else if (!sessionId && isInitializeRequest(req.body)) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            console.log(`Session initialized: ${sid}`);
+            transports[sid] = transport;
+          }
+        });
+        
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid && transports[sid]) {
+            console.log(`Session closed: ${sid}`);
+            delete transports[sid];
+          }
+        };
+        
+        const server = createMcpServer();
+        await server.connect(transport);
+      } else {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: null
+        });
+        return;
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error('Error handling MCP request:', error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: '2.0',
+          error: { code: -32603, message: 'Internal server error' },
+          id: null
+        });
+      }
+    }
   });
 
   app.get('/mcp', async (req, res) => {
-    console.log('收到 GET /mcp 请求');
-    const server = createMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined
-    });
-    await server.connect(transport);
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    console.log('收到 GET /mcp 请求, sessionId:', sessionId);
+    
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    
+    const transport = transports[sessionId];
     await transport.handleRequest(req, res);
   });
 
   app.delete('/mcp', async (req, res) => {
-    console.log('收到 DELETE /mcp 请求');
-    const server = createMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined
-    });
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    console.log('收到 DELETE /mcp 请求, sessionId:', sessionId);
+    
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    
+    try {
+      const transport = transports[sessionId];
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error('Error handling session termination:', error);
+      if (!res.headersSent) {
+        res.status(500).send('Error processing session termination');
+      }
+    }
   });
 
   app.get('/api/messages', async (_req, res) => {
@@ -228,11 +285,21 @@ async function runHTTP(): Promise<void> {
   });
 
   const publicPath = path.join(__dirname, '../public');
+  console.log(`静态文件目录: ${publicPath}`);
   app.use(express.static(publicPath));
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`MCP Server running on port ${PORT}`);
-    console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
+    console.log(`=================================`);
+    console.log(`MCP 留言板服务器已启动`);
+    console.log(`网页留言板: http://localhost:${PORT}`);
+    console.log(`MCP 端点: http://localhost:${PORT}/mcp`);
+    console.log(`API 端点: http://localhost:${PORT}/api/messages`);
+    if (process.env.GIST_ID) {
+      console.log(`数据存储: GitHub Gist`);
+    } else {
+      console.log(`数据存储: 本地内存 (未配置 Gist)`);
+    }
+    console.log(`=================================`);
   });
 }
 
