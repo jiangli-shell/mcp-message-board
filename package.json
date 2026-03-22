@@ -1,7 +1,6 @@
 {
   "name": "mcp-message-board",
   "version": "1.0.0",
-  "description": "MCP Message Board Server with GitHub Gist storage",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -20,8 +19,5 @@
     "@types/cors": "^2.8.17",
     "@types/uuid": "^9.0.7",
     "typescript": "^5.3.3"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
