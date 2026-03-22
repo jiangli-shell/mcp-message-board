@@ -1,17 +1,17 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { randomUUID } from 'crypto';
-import { createServer } from './mcp-server.js';
+import { z } from 'zod';
 import { messageStore } from './store.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const MODE = process.env.MCP_MODE || 'sse';
+const MODE = process.env.MCP_MODE || 'http';
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
 console.log('=== MCP 留言板服务器 ===');
@@ -22,8 +22,121 @@ if (process.env.GIST_ID) {
   console.log(`Gist ID: ${process.env.GIST_ID}`);
 }
 
+function createMcpServer(): McpServer {
+  const server = new McpServer({
+    name: 'message-board-server',
+    version: '1.0.0',
+  });
+
+  server.registerTool(
+    'get_all_messages',
+    {
+      title: '获取所有留言',
+      description: '获取留言板上的所有留言',
+      inputSchema: z.object({})
+    },
+    async () => {
+      const messages = await messageStore.getAllMessages();
+      return {
+        content: [{ type: 'text', text: JSON.stringify(messages, null, 2) }]
+      };
+    }
+  );
+
+  server.registerTool(
+    'get_message_by_id',
+    {
+      title: '获取留言详情',
+      description: '根据ID获取特定留言',
+      inputSchema: z.object({
+        messageId: z.string().describe('留言的ID')
+      })
+    },
+    async ({ messageId }) => {
+      const message = await messageStore.getMessageById(messageId);
+      if (!message) {
+        return {
+          content: [{ type: 'text', text: `未找到ID为 ${messageId} 的留言` }],
+          isError: true
+        };
+      }
+      return {
+        content: [{ type: 'text', text: JSON.stringify(message, null, 2) }]
+      };
+    }
+  );
+
+  server.registerTool(
+    'create_message',
+    {
+      title: '创建留言',
+      description: '创建一条新留言',
+      inputSchema: z.object({
+        content: z.string().describe('留言内容'),
+        author: z.string().optional().default('Claude').describe('留言者名称')
+      })
+    },
+    async ({ content, author }) => {
+      const message = await messageStore.createMessage(content, author || 'Claude');
+      return {
+        content: [{ type: 'text', text: `成功创建留言:\n${JSON.stringify(message, null, 2)}` }]
+      };
+    }
+  );
+
+  server.registerTool(
+    'reply_to_message',
+    {
+      title: '回复留言',
+      description: '回复某条留言',
+      inputSchema: z.object({
+        messageId: z.string().describe('要回复的留言ID'),
+        content: z.string().describe('回复内容'),
+        author: z.string().optional().default('Claude').describe('回复者名称')
+      })
+    },
+    async ({ messageId, content, author }) => {
+      const reply = await messageStore.replyToMessage(messageId, content, author || 'Claude');
+      if (!reply) {
+        return {
+          content: [{ type: 'text', text: `未找到ID为 ${messageId} 的留言，无法回复` }],
+          isError: true
+        };
+      }
+      return {
+        content: [{ type: 'text', text: `成功回复留言:\n${JSON.stringify(reply, null, 2)}` }]
+      };
+    }
+  );
+
+  server.registerTool(
+    'delete_message',
+    {
+      title: '删除留言',
+      description: '删除一条留言',
+      inputSchema: z.object({
+        messageId: z.string().describe('要删除的留言ID')
+      })
+    },
+    async ({ messageId }) => {
+      const success = await messageStore.deleteMessage(messageId);
+      if (!success) {
+        return {
+          content: [{ type: 'text', text: `未找到ID为 ${messageId} 的留言，无法删除` }],
+          isError: true
+        };
+      }
+      return {
+        content: [{ type: 'text', text: `成功删除留言 ${messageId}` }]
+      };
+    }
+  );
+
+  return server;
+}
+
 async function runStdio(): Promise<void> {
-  const server = createServer();
+  const server = createMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -40,8 +153,6 @@ async function runHTTP(): Promise<void> {
   }));
   
   app.use(express.json());
-  app.use(express.raw({ type: 'application/octet-stream', limit: '10mb' }));
-  app.use(express.text({ type: 'text/plain' }));
 
   app.get('/health', async (_req, res) => {
     const messages = await messageStore.getAllMessages();
@@ -53,30 +164,34 @@ async function runHTTP(): Promise<void> {
     });
   });
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
+  app.post('/mcp', async (req, res) => {
+    console.log('收到 POST /mcp 请求');
+    const server = createMcpServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
   });
 
-  const server = createServer();
-  server.connect(transport);
-
-  const handleRequest = async (req: express.Request, res: express.Response) => {
-    console.log(`收到 ${req.method} 请求: ${req.path}`);
-    await transport.handleRequest(req as any, res as any, req.body);
-  };
-
-  app.get('/mcp', handleRequest);
-  app.post('/mcp', handleRequest);
-  app.delete('/mcp', handleRequest);
-
-  app.get('/sse', async (req, res) => {
-    console.log('SSE 连接请求 (兼容模式)');
-    await transport.handleRequest(req as any, res as any);
+  app.get('/mcp', async (req, res) => {
+    console.log('收到 GET /mcp 请求');
+    const server = createMcpServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res);
   });
 
-  app.post('/messages', async (req, res) => {
-    console.log('收到 POST 消息 (兼容模式)');
-    await transport.handleRequest(req as any, res as any, req.body);
+  app.delete('/mcp', async (req, res) => {
+    console.log('收到 DELETE /mcp 请求');
+    const server = createMcpServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res);
   });
 
   app.get('/api/messages', async (_req, res) => {
@@ -113,21 +228,11 @@ async function runHTTP(): Promise<void> {
   });
 
   const publicPath = path.join(__dirname, '../public');
-  console.log(`静态文件目录: ${publicPath}`);
   app.use(express.static(publicPath));
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`=================================`);
-    console.log(`MCP 留言板服务器已启动 (HTTP 模式)`);
-    console.log(`网页留言板: http://localhost:${PORT}`);
-    console.log(`MCP 端点: http://localhost:${PORT}/mcp`);
-    console.log(`API 端点: http://localhost:${PORT}/api/messages`);
-    if (process.env.GIST_ID) {
-      console.log(`数据存储: GitHub Gist`);
-    } else {
-      console.log(`数据存储: 本地内存 (未配置 Gist)`);
-    }
-    console.log(`=================================`);
+    console.log(`MCP Server running on port ${PORT}`);
+    console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
   });
 }
 
@@ -136,7 +241,7 @@ async function main(): Promise<void> {
     if (MODE === 'stdio') {
       await runStdio();
     } else {
-      runHTTP();
+      await runHTTP();
     }
   } catch (error) {
     console.error('服务器启动失败:', error);
