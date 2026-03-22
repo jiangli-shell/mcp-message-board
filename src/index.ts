@@ -30,7 +30,11 @@ async function runStdio(): Promise<void> {
 async function runSSE(): Promise<void> {
   const app = express();
   
-  app.use(cors());
+  app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+  }));
   app.use(express.json());
 
   app.get('/health', async (_req, res) => {
@@ -43,8 +47,13 @@ async function runSSE(): Promise<void> {
     });
   });
 
-  app.get('/sse', async (_req, res) => {
+  app.get('/sse', async (req, res) => {
     console.log('新的 SSE 连接');
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
     const server = createServer();
     const transport = new SSEServerTransport('/messages', res);
     await server.connect(transport);
@@ -96,7 +105,7 @@ async function runSSE(): Promise<void> {
   console.log(`静态文件目录: ${publicPath}`);
   app.use(express.static(publicPath));
 
-  app.listen(PORT, () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`=================================`);
     console.log(`MCP 留言板服务器已启动 (SSE 模式)`);
     console.log(`网页留言板: http://localhost:${PORT}`);
