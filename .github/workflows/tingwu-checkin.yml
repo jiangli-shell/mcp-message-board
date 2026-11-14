@@ -1,0 +1,44 @@
+name: Tingwu Daily Checkin
+
+on:
+  schedule:
+    # UTC 23:37 = 北京时间 07:37。避开整点以降低 Actions 调度延迟。
+    - cron: '37 23 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: tingwu-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 独立安装 playwright，不污染主项目依赖
+      - name: Install Playwright
+        run: npm install --no-save --no-package-lock playwright@1.48.0
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run checkin
+        env:
+          TINGWU_COOKIE: ${{ secrets.TINGWU_COOKIE }}
+        run: node scripts/tingwu-checkin.mjs
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 7
+          if-no-files-found: ignore
